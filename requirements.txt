@@ -1,0 +1,5 @@
+streamlit>=1.40,<2
+yfinance>=0.2.50
+pandas>=2.2
+python-dotenv>=1.0
+python-telegram-bot>=21,<23
