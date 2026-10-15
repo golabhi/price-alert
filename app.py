@@ -9,8 +9,12 @@ import yfinance as yf
 from dotenv import load_dotenv
 from telegram import Bot
 
+import threading
+import time
+
 load_dotenv()
 DB_PATH = os.getenv("DB_PATH", "stock_alerts.db")
+CHECK_INTERVAL_SECONDS = max(10, int(os.getenv("CHECK_INTERVAL_SECONDS", "30")))
 TZ = ZoneInfo("Asia/Kolkata")
 
 
@@ -101,12 +105,79 @@ def send_telegram(message):
         finally:
             loop.close()
 
-
 def money(value, currency):
     return f"{currency} {value:,.4f}".rstrip("0").rstrip(".")
 
 
+def check_alerts():
+    """Checks all active alerts once against current market price."""
+    with connect_db() as conn:
+        alerts = conn.execute(
+            "SELECT * FROM alerts WHERE enabled=1 AND triggered=0 ORDER BY id"
+        ).fetchall()
+
+    for alert in alerts:
+        try:
+            price = get_price(alert["symbol"])
+            now = datetime.now(TZ).isoformat()
+            condition_met = (
+                price >= float(alert["target"]) if alert["condition"] == "above"
+                else price <= float(alert["target"])
+            )
+            with connect_db() as conn:
+                conn.execute(
+                    "UPDATE alerts SET last_price=?, last_checked=? WHERE id=?",
+                    (price, now, alert["id"])
+                )
+            if condition_met:
+                message = (
+                    f"🔔 STOCK PRICE ALERT\n"
+                    f"Stock: {alert['label']} ({alert['symbol']})\n"
+                    f"Condition: price {alert['condition']} {money(alert['target'], alert['currency'])}\n"
+                    f"Available price: {money(price, alert['currency'])}\n"
+                    f"Market: {alert['market']}\n"
+                    f"Checked: {now}\n\n"
+                    f"Note: Yahoo Finance data may be delayed or stale."
+                )
+                send_telegram(message)
+                with connect_db() as conn:
+                    conn.execute("""
+                        UPDATE alerts SET triggered=1, enabled=0, last_message=?
+                        WHERE id=? AND triggered=0
+                    """, (message, alert["id"]))
+                    conn.execute("""
+                        INSERT INTO alert_events
+                        (alert_id, symbol, price, target, condition, message, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        alert["id"], alert["symbol"], price, alert["target"],
+                        alert["condition"], message, now
+                    ))
+                print(f"[TRIGGERED] #{alert['id']} {alert['symbol']} price={price}")
+            else:
+                print(f"[OK] #{alert['id']} {alert['symbol']} price={price}")
+        except Exception as exc:
+            print(f"[ERROR] #{alert['id']} {alert['symbol']}: {exc}")
+
+
+def _worker_loop():
+    while True:
+        try:
+            check_alerts()
+        except Exception as e:
+            print(f"[WORKER ERROR] {e}")
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
+@st.cache_resource
+def start_background_worker():
+    thread = threading.Thread(target=_worker_loop, daemon=True, name="StockAlertWorkerThread")
+    thread.start()
+    return thread
+
+
 init_db()
+start_background_worker()
 st.set_page_config(page_title="Stock Price Alerts", page_icon="🔔", layout="wide")
 st.title("🔔 Stock Price Alert Dashboard")
 st.caption("Personal-use demo • Python + Streamlit + SQLite + Yahoo Finance + Telegram")
@@ -125,6 +196,16 @@ with st.sidebar:
         try:
             send_telegram("✅ Stock Alert app test message. Telegram notifications are working.")
             st.success("Test message sent. Check Telegram.")
+        except Exception as exc:
+            st.error(str(exc))
+    st.divider()
+    st.header("Background monitor")
+    st.write("Background checker:", "🟢 Running inside app" if start_background_worker().is_alive() else "🔴 Stopped")
+    if st.button("⚡ Run alert check now", use_container_width=True):
+        try:
+            check_alerts()
+            st.success("Alert check completed!")
+            st.rerun()
         except Exception as exc:
             st.error(str(exc))
     st.divider()
@@ -166,8 +247,41 @@ with tab_add:
                             current, datetime.now(TZ).isoformat(), datetime.now(TZ).isoformat()
                         ))
                         alert_id = cur.lastrowid
-                    st.success(f"Alert #{alert_id} created. Latest available price: {money(current, currency)}")
-                    st.info("The background worker must be running for automatic alerts.")
+                    
+                    # Evaluate condition immediately
+                    condition_met = (
+                        current >= float(target) if condition == "above"
+                        else current <= float(target)
+                    )
+                    if condition_met:
+                        now_str = datetime.now(TZ).isoformat()
+                        message = (
+                            f"🔔 STOCK PRICE ALERT\n"
+                            f"Stock: {display_name} ({symbol})\n"
+                            f"Condition: price {condition} {money(float(target), currency)}\n"
+                            f"Available price: {money(current, currency)}\n"
+                            f"Market: {market}\n"
+                            f"Checked: {now_str}\n\n"
+                            f"Note: Yahoo Finance data may be delayed or stale."
+                        )
+                        send_telegram(message)
+                        with connect_db() as conn:
+                            conn.execute("""
+                                UPDATE alerts SET triggered=1, enabled=0, last_message=?
+                                WHERE id=?
+                            """, (message, alert_id))
+                            conn.execute("""
+                                INSERT INTO alert_events
+                                (alert_id, symbol, price, target, condition, message, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                alert_id, symbol, current, float(target),
+                                condition, message, now_str
+                            ))
+                        st.success(f"🎉 Alert #{alert_id} target was already met! Notification sent to Telegram. Current price: {money(current, currency)}")
+                    else:
+                        st.success(f"Alert #{alert_id} created. Latest available price: {money(current, currency)}")
+                        st.info("Alert is active and being monitored automatically in the background.")
                 except Exception as exc:
                     st.error(f"Could not create alert: {exc}")
 
